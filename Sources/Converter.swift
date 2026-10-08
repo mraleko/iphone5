@@ -5,6 +5,12 @@ struct ConversionError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+enum ConversionProgress {
+    case rendering(frames: Int, fraction: Double?)
+    case finalizing
+    case finished
+}
+
 // One instance per job. The lock allows the UI to cancel a running child process.
 final class Converter: @unchecked Sendable {
     private let lock = NSLock()
@@ -28,7 +34,7 @@ final class Converter: @unchecked Sendable {
         throw ConversionError(message: "FFmpeg is required. Install it with ‘brew install ffmpeg’, then try again.")
     }
 
-    private func run(_ name: String, _ arguments: [String]) throws -> Data {
+    private func run(_ name: String, _ arguments: [String], onLine: ((String) -> Void)? = nil) throws -> Data {
         let task = Process()
         task.executableURL = try executable(name)
         task.arguments = arguments
@@ -42,7 +48,18 @@ final class Converter: @unchecked Sendable {
         FileManager.default.createFile(atPath: stderr.path, contents: nil)
         let out = try FileHandle(forWritingTo: stdout)
         let err = try FileHandle(forWritingTo: stderr)
-        defer { try? out.close(); try? err.close() }
+        let reader = try FileHandle(forReadingFrom: stdout)
+        defer { try? out.close(); try? err.close(); try? reader.close() }
+        var pending = Data()
+        func readProgress() {
+            guard let data = try? reader.read(upToCount: 65536), !data.isEmpty else { return }
+            pending.append(data)
+            while let newline = pending.firstIndex(of: 10) {
+                let line = String(decoding: pending[..<newline], as: UTF8.self)
+                pending.removeSubrange(...newline)
+                onLine?(line)
+            }
+        }
         task.standardOutput = out
         task.standardError = err
         task.standardInput = FileHandle.nullDevice
@@ -51,6 +68,15 @@ final class Converter: @unchecked Sendable {
         do { try task.run() } catch { lock.unlock(); throw error }
         process = task
         lock.unlock()
+        if onLine != nil {
+            // Poll only the newly written progress bytes on the worker queue.
+            // File-backed output avoids pipe backpressure during long renders.
+            while task.isRunning {
+                readProgress()
+                Thread.sleep(forTimeInterval: 0.15)
+            }
+            readProgress()
+        }
         task.waitUntilExit()
         lock.lock()
         process = nil
@@ -68,12 +94,12 @@ final class Converter: @unchecked Sendable {
         return try Data(contentsOf: stdout)
     }
 
-    func convert(input: URL, output: URL) throws {
+    func convert(input: URL, output: URL, onProgress: @escaping (ConversionProgress) -> Void = { _ in }) throws {
         guard input.isFileURL else { throw ConversionError(message: "Choose a video stored on this Mac.") }
         guard !FileManager.default.fileExists(atPath: output.path) else {
             throw ConversionError(message: "The output file already exists. Choose a new filename.")
         }
-        let metadata = try run("ffprobe", ["-v", "error", "-show_streams", "-of", "json", input.path])
+        let metadata = try run("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", input.path])
         let root = try JSONSerialization.jsonObject(with: metadata) as? [String: Any]
         let streams = root?["streams"] as? [[String: Any]] ?? []
         guard let video = streams.first(where: {
@@ -85,6 +111,14 @@ final class Converter: @unchecked Sendable {
         let transfer = video["color_transfer"] as? String ?? ""
         let hdr = transfer == "arib-std-b67" || transfer == "smpte2084"
         let hasAudio = streams.contains { $0["codec_type"] as? String == "audio" }
+        let format = root?["format"] as? [String: Any]
+        let duration = [video["duration"], format?["duration"]]
+            .compactMap { $0 as? String }.compactMap(Double.init)
+            .first { $0.isFinite && $0 > 0 }
+        // Output is constant 30 fps, including frame duplication/drop for VFR
+        // input. Audio timestamps can run ahead, so never use out_time here.
+        let expectedFrames = duration.map { max(1, ceil($0 * 30)) }
+        onProgress(.rendering(frames: 0, fraction: expectedFrames == nil ? nil : 0))
 
         // Autorotation happens before filters. Fit the displayed image inside a
         // landscape/portrait 1080p envelope, preserving framing and square pixels.
@@ -112,32 +146,69 @@ final class Converter: @unchecked Sendable {
             let range = video["color_range"] as? String == "pc" ? "full" : "limited"
             filters += ["zscale=pin=\(p):tin=\(t):min=\(m):rin=\(range):p=bt709:t=bt709:m=bt709:r=limited", "format=yuv420p"]
         }
-        // Restrained approximation of the older ISP: less fine detail, modest
-        // edge enhancement, reduced shadow/highlight latitude and subtle noise.
-        // These are aesthetic estimates, not a measured sensor calibration.
+        // TikTok reference: darker low/mid tones, clipped stage lighting,
+        // saturated colour and softer motion/detail. Temporal blending is an
+        // approximation of motion smear, not recovered shutter exposure.
         filters += [
-            "gblur=sigma=0.45:steps=1",
-            "unsharp=5:5:0.35:3:3:0",
-            "eq=contrast=1.055:brightness=-0.008:saturation=0.96:gamma=0.985",
-            "noise=c0s=2:c0f=t+u:c1s=1:c1f=t+u:c2s=1:c2f=t+u:all_seed=5",
+            "tmix=frames=2:weights='3 1'",
+            "gblur=sigma=1.1:steps=2",
+            "unsharp=5:5:0.15:3:3:0",
+            "eq=saturation=1.12",
+            "curves=master='0/0 0.10/0.04 0.25/0.20 0.45/0.50 0.65/0.85 0.76/1 1/1'",
             "format=yuv420p"
         ]
-        var arguments = ["-hide_banner", "-loglevel", "error", "-nostdin", "-n", "-i", input.path,
-                         "-map", "0:\(index)", "-map", "0:a:0?", "-map_metadata", "-1", "-map_chapters", "-1",
-                         "-vf", filters.joined(separator: ","),
+        // Only bright pixels feed the halo. Add luminance, not chroma, so the
+        // bloom cannot turn dark regions purple or wash the whole image grey.
+        // Grain is temporal and weighted toward shadows, with weaker chroma
+        // noise and much less luma noise on already clipped highlights.
+        var graph = [
+            "[0:\(index)]" + filters.joined(separator: ",") + ",split=2[detail][highlights]",
+            "[highlights]lutyuv=y='16+max(0,val-175)*2':u=128:v=128,gblur=sigma=14:steps=2[halo]",
+            "[detail][halo]blend=c0_expr='min(235,A+0.25*(B-16))':c1_expr=A:c2_expr=A,split=2[clean][grain]",
+            "[grain]noise=c0s=12:c0f=t+u:c1s=6:c1f=t+u:c2s=6:c2f=t+u:all_seed=5[noisy]",
+            "[clean][noisy]blend=c0_expr='A+(B-A)*(1-0.8*clip((A-16)/219,0,1))':c1_expr='A+0.65*(B-A)':c2_expr='A+0.65*(B-A)',limiter=min=16:max=235:planes=1,format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[video]"
+        ].joined(separator: ";")
+        if hasAudio {
+            // Retain the reference's vocal/crowd presence with modest bass emphasis;
+            // overload loud passages and compress their envelope, not all
+            // high frequencies. Tuned using measured decoded AAC output.
+            graph += ";[0:a:0]" + [
+                "aformat=channel_layouts=mono", "highpass=f=85:p=2",
+                "bass=g=3:f=160:t=q:w=0.7", "equalizer=f=1400:t=q:w=0.7:g=3",
+                "aeval=exprs='clip(val(0)*3,-0.7,0.7)':c=mono",
+                "treble=g=3:f=900:t=q:w=0.7", "lowpass=f=9500:p=2",
+                "acompressor=threshold=0.15:ratio=4:attack=10:release=140:makeup=1.5",
+                "volume=0.72", "alimiter=limit=0.6:level=false:latency=true"
+            ].joined(separator: ",") + "[audio]"
+        }
+        var arguments = ["-hide_banner", "-loglevel", "error", "-nostdin", "-nostats",
+                         "-progress", "pipe:1", "-stats_period", "0.25", "-n", "-i", input.path,
+                         "-filter_complex", graph,
+                         "-map", "[video]", "-map_metadata", "-1", "-map_chapters", "-1",
                          "-c:v", "libx264", "-preset", "medium", "-profile:v", "high", "-level:v", "4.1",
-                         "-b:v", "17M", "-maxrate", "20M", "-bufsize", "34M", "-g", "30",
+                         "-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M", "-g", "30",
                          "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709",
                          "-colorspace", "bt709", "-color_range", "tv"]
         if hasAudio {
-            arguments += ["-af", [
-                "aformat=channel_layouts=mono", "highpass=f=100:p=2", "lowpass=f=14000:p=2",
-                "equalizer=f=2800:t=q:w=0.8:g=1.5",
-                "acompressor=threshold=0.125:ratio=2:attack=10:release=180:makeup=1.15",
-                "alimiter=limit=0.95:level=false:latency=true"
-            ].joined(separator: ","), "-c:a", "aac", "-b:a", "64k", "-ar", "44100", "-ac", "1"]
+            arguments += ["-map", "[audio]", "-c:a", "aac", "-b:a", "64k", "-ar", "44100", "-ac", "1"]
         }
         arguments += ["-metadata:s:v:0", "rotate=0", "-movflags", "+faststart", "-f", "mov", output.path]
-        _ = try run("ffmpeg", arguments)
+        var frames = 0
+        var finalizing = false
+        _ = try run("ffmpeg", arguments) { line in
+            if line.hasPrefix("frame="), let count = Int(line.dropFirst(6).trimmingCharacters(in: .whitespaces)) {
+                frames = max(frames, count)
+            } else if line.hasPrefix("progress=") {
+                if line == "progress=end" || expectedFrames.map({ Double(frames) >= $0 }) == true {
+                    finalizing = true
+                    onProgress(.finalizing)
+                } else if !finalizing {
+                    onProgress(.rendering(frames: frames, fraction: expectedFrames.map { min(0.99, Double(frames) / $0) }))
+                }
+            }
+        }
+        // Do not report completion on a progress=end record alone: the child
+        // must exit successfully, including fast-start muxing and disk writes.
+        onProgress(.finished)
     }
 }
